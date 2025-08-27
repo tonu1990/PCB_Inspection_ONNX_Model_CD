@@ -1,0 +1,31 @@
+name: ModelCD — Dry Run (Pi write test)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  dry_run:
+    # Make sure this matches your runner labels
+    runs-on: [self-hosted, model-cd]
+    steps:
+      - name: Show runner info
+        run: |
+          echo "Runner: $RUNNER_NAME"
+          echo "OS/Arch: $RUNNER_OS/$RUNNER_ARCH"
+          whoami
+          uname -a
+
+      - name: Touch test file in /opt/edge/models/tmp
+        run: |
+          set -e
+          mkdir -p /opt/edge/models/tmp
+          echo "hello from GH Actions at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > /opt/edge/models/tmp/gh-actions-test.txt
+          ls -l /opt/edge/models/tmp
+
+      - name: Append to deployments.log
+        run: |
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) DRY-RUN OK (runner=$RUNNER_NAME)" | tee -a /opt/edge/models/deployments.log
+
+      - name: Show tail of deployments.log
+        run: |
+          tail -n 5 /opt/edge/models/deployments.log || true
