@@ -130,7 +130,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          FILE="$(ls -1 *.onnx | head -n1)"
+          FILE="$(find . -maxdepth 4 -type f -name '*.onnx' | head -n1)"
           echo "File: $FILE"
           SHA_LOCAL="$(sha256sum "$FILE" | cut -d' ' -f1)"
           SHA_EXPECT="${{ needs.validate.outputs.model_sha }}"
@@ -143,7 +143,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          FILE="$(ls -1 *.onnx | head -n1)"
+          FILE="$(find . -maxdepth 4 -type f -name '*.onnx' | head -n1)"
           MODEL_ID="${{ needs.validate.outputs.model_sha }}"
           SHORT="${{ needs.validate.outputs.short_sha }}"
           STAMP="${{ needs.validate.outputs.utc_stamp }}"
