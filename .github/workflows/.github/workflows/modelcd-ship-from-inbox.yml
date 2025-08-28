@@ -1,0 +1,185 @@
+name: ModelCD — Ship ONNX from inbox
+
+on:
+  # Runs automatically when you push/commit an ONNX file under inbox/
+  push:
+    paths:
+      - 'inbox/**/*.onnx'
+      - 'inbox/*.onnx'
+  # Also allow manual runs
+  workflow_dispatch: {}
+
+concurrency:
+  group: model-cd
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate ONNX (cloud)
+    runs-on: ubuntu-latest
+    outputs:
+      model_name: ${{ steps.locate.outputs.model_name }}
+      model_sha:  ${{ steps.hash.outputs.model_sha }}
+      short_sha:  ${{ steps.hash.outputs.short_sha }}
+      utc_stamp:  ${{ steps.utc.outputs.utc_stamp }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate ONNX file in inbox/
+        id: locate
+        shell: bash
+        run: |
+          set -e
+          MODEL_PATH="$(ls -1 inbox/*.onnx | head -n1)"
+          if [ -z "$MODEL_PATH" ]; then
+            echo "No ONNX found under inbox/"; exit 1
+          fi
+          echo "Found: $MODEL_PATH"
+          echo "MODEL_PATH=$MODEL_PATH" >> $GITHUB_ENV
+          echo "model_name=$(basename "$MODEL_PATH")" >> $GITHUB_OUTPUT
+
+      - name: Check file size (basic sanity)
+        shell: bash
+        run: |
+          BYTES=$(stat -c%s "$MODEL_PATH")
+          echo "Size: $BYTES bytes"
+          # Soft limit for beginners: 200 MB (Git normal push limit ~100MB; Git LFS for bigger)
+          if [ "$BYTES" -gt 200000000 ]; then
+            echo "File too large for this simple flow. Use Git LFS or Releases."; exit 1
+          fi
+
+      - name: Setup Python and install ONNX
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install onnx
+        run: pip install --quiet onnx
+
+      - name: Run ONNX checker (structure & ops)
+        shell: bash
+        run: |
+          python - << 'PY'
+          import os, onnx, sys
+          p = os.environ["MODEL_PATH"]
+          m = onnx.load(p)
+          onnx.checker.check_model(m)
+          print("ONNX checker: OK")
+          # Optional: basic input tensor name/shape print
+          g = m.graph
+          for i in g.input:
+            dims = [d.dim_value for d in i.type.tensor_type.shape.dim]
+            print("Input:", i.name, dims)
+          PY
+
+      - name: Compute sha256 (identity)
+        id: hash
+        shell: bash
+        run: |
+          SHA=$(sha256sum "$MODEL_PATH" | cut -d' ' -f1)
+          echo "sha256: $SHA"
+          echo "$SHA  $(basename "$MODEL_PATH")" > sha256.txt
+          echo "model_sha=$SHA" >> $GITHUB_OUTPUT
+          echo "short_sha=${SHA:0:12}" >> $GITHUB_OUTPUT
+
+      - name: UTC timestamp
+        id: utc
+        shell: bash
+        run: echo "utc_stamp=$(date -u +%Y%m%d-%H%M)" >> $GITHUB_OUTPUT
+
+      - name: Build a minimal manifest.json
+        shell: bash
+        run: |
+          cat > manifest.json << JSON
+          {
+            "model_id_sha256": "${{ steps.hash.outputs.model_sha }}",
+            "filename":        "${{ steps.locate.outputs.model_name }}",
+            "created_at_utc":  "${{ steps.utc.outputs.utc_stamp }}",
+            "framework":       "onnx",
+            "opset":           "unknown",
+            "quantization":    "unknown",
+            "notes":           "initial simple manifest"
+          }
+          JSON
+          cat manifest.json
+
+      - name: Upload bundle as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: validated-model
+          path: |
+            ${{ env.MODEL_PATH }}
+            sha256.txt
+            manifest.json
+
+  deliver:
+    name: Deliver to Pi and flip current.onnx
+    needs: validate
+    runs-on: [self-hosted, model-cd]   # your Pi runner labels
+    steps:
+      - name: Download validated bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: validated-model
+
+      - name: Show downloaded files
+        run: ls -l
+
+      - name: Verify sha256 on Pi (integrity)
+        id: verify
+        shell: bash
+        run: |
+          set -e
+          FILE="$(ls -1 *.onnx | head -n1)"
+          echo "File: $FILE"
+          SHA_LOCAL="$(sha256sum "$FILE" | cut -d' ' -f1)"
+          SHA_EXPECT="${{ needs.validate.outputs.model_sha }}"
+          echo "Local: $SHA_LOCAL"
+          echo "Expect: $SHA_EXPECT"
+          test "$SHA_LOCAL" = "$SHA_EXPECT" || (echo "SHA256 mismatch"; exit 1)
+          echo "ok=true" >> $GITHUB_OUTPUT
+
+      - name: Stage, move, and atomic switch
+        shell: bash
+        run: |
+          set -e
+          FILE="$(ls -1 *.onnx | head -n1)"
+          MODEL_ID="${{ needs.validate.outputs.model_sha }}"
+          SHORT="${{ needs.validate.outputs.short_sha }}"
+          STAMP="${{ needs.validate.outputs.utc_stamp }}"
+          TARGET_DIR="/opt/edge/models"
+          STAGE="$TARGET_DIR/tmp/$MODEL_ID"
+          FINAL="$TARGET_DIR/models/pcb-${STAMP}-${SHORT}.onnx"
+          MANIFEST_FINAL="$TARGET_DIR/manifests/pcb-${MODEL_ID}.json"
+
+          echo "Staging at: $STAGE"
+          mkdir -p "$STAGE"
+          cp "$FILE" "$STAGE/model.onnx"
+          cp manifest.json "$STAGE/manifest.json"
+
+          # Move into final, non-destructive
+          mv "$STAGE/model.onnx" "$FINAL"
+          mv "$STAGE/manifest.json" "$MANIFEST_FINAL"
+          rmdir "$STAGE" || true
+
+          # Update previous.onnx to old current target (if exists)
+          if [ -L "$TARGET_DIR/current.onnx" ]; then
+            OLD="$(readlink -f "$TARGET_DIR/current.onnx")"
+            ln -sfn "$OLD" "$TARGET_DIR/previous.onnx"
+          fi
+
+          # Atomic flip current.onnx to new file
+          ln -sfn "$FINAL" "$TARGET_DIR/current.onnx"
+
+          # Log the deployment
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) DEPLOY model_id=${MODEL_ID} file=$(basename "$FINAL")" >> "$TARGET_DIR/deployments.log"
+
+          # Show where the symlinks point
+          echo "current.onnx -> $(readlink -f "$TARGET_DIR/current.onnx")"
+          [ -L "$TARGET_DIR/previous.onnx" ] && echo "previous.onnx -> $(readlink -f "$TARGET_DIR/previous.onnx")" || echo "previous.onnx not set (first deploy)"
+
+      - name: List model directory (for sanity)
+        run: |
+          ls -l /opt/edge/models
+          ls -l /opt/edge/models/models
+          ls -l /opt/edge/models/manifests
