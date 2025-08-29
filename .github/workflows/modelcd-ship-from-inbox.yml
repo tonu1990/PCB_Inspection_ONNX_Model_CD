@@ -213,6 +213,7 @@ jobs:
 
 
       - name: Stage, move, and atomic switch
+        if: steps.idem.outputs.skip != 'true'
         shell: bash
         run: |
           set -e
